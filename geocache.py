@@ -6,77 +6,75 @@ import time
 
 class PointCache(object):
 
-  _MAX_POINTS_PER_SECTOR = 125
-  _TTL = 60
-
-  _CachePoint = collections.namedtuple('CachePoint',
-      ('point_id', 'coord', 'priority', 'exp_time'))
-
-  _CACHE = collections.defaultdict(list)
-
-  @staticmethod
-  def _RemoveExpiredPoints(points, current_time):
-    points[:] = (point for point in points if point.exp_time > current_time)
-
-  @staticmethod
-  def _UpdatePoint(points, point_id, coord, priority):
-    current_time = time.time()
-
-    PointCache._RemoveExpiredPoints(points, current_time)
-
-    exp_time = current_time + PointCache._TTL
-
-    assert len(points) <= PointCache._MAX_POINTS_PER_SECTOR
-
-    min_priority_index = 0
-    for i, point in enumerate(points):
-      if point.point_id == point_id:
-        points[i] = PointCache._CachePoint(point_id, coord, priority, exp_time)
-        return True
-      if point.priority < points[min_priority_index].priority:
-        min_priority_index = i
-
-    if len(points) == PointCache._MAX_POINTS_PER_SECTOR:
-      if points[min_priority_index].priority < priority:
-        points[min_priority_index] = PointCache._CachePoint(point_id, coord,
-            priority, exp_time)
-        return True
-      return False
-
-    point = PointCache._CachePoint(point_id, coord, priority, exp_time)
-    points.append(point)
-    return True
-
   @staticmethod
   def UpdatePointInSector(app_id, subject_id, sector_id, zoom_level, point_id,
-      coord, priority):
+      priority):
     key = (app_id, subject_id, sector_id, zoom_level)
-
     points = PointCache._CACHE[key]
-
-    return PointCache._UpdatePoint(points, point_id, coord, priority)
+    return PointCache._UpdatePoint(points, point_id, priority)
 
   @staticmethod
   def GetPointsInSector(app_id, subject_id, sector_id, zoom_level):
     key = (app_id, subject_id, sector_id, zoom_level)
-
     points = PointCache._CACHE.get(key)
     if not points:
       return ()
 
     current_time = time.time()
-
     PointCache._RemoveExpiredPoints(points, current_time)
-
     return points
+
+  _MAX_POINTS_PER_SECTOR = 125
+  _TTL = 60
+
+  _Point = collections.namedtuple('Point',
+      ('point_id', 'priority', 'exp_time'))
+
+  _CACHE = collections.defaultdict(list)
+
+  @staticmethod
+  def _RemoveExpiredPoints(points, current_time):
+    points[:] = [p for p in points if p.exp_time > current_time]
+
+  @staticmethod
+  def _UpdatePoint(points, point_id, priority):
+    current_time = time.time()
+    PointCache._RemoveExpiredPoints(points, current_time)
+    exp_time = int(current_time + PointCache._TTL)
+
+    assert len(points) <= PointCache._MAX_POINTS_PER_SECTOR
+
+    new_point = PointCache._Point(point_id, priority, exp_time)
+    if not points:
+      points.append(new_point)
+      return True
+
+    min_priority_index = 0
+    min_priority = points[0].priority
+    for i, p in enumerate(points):
+      if p.point_id == point_id:
+        points[i] = new_point
+        return True
+      if p.priority < min_priority:
+        min_priority_index = i
+        min_priority = p.priority
+
+    if len(points) == PointCache._MAX_POINTS_PER_SECTOR:
+      if min_priority < priority:
+        points[min_priority_index] = new_point
+        return True
+      return False
+
+    points.append(new_point)
+    return True
 
 
 class AppStorage(object):
 
   _APPS = {}
-
   _App = collections.namedtuple('App', ('auth_key', 'hmac_key',
       'max_zoom_level', 'points'))
+  _Point = collections.namedtuple('Point', ('subjects', 'coord'))
 
   @staticmethod
   def CreateApp(app_id, max_zoom_level):
@@ -100,68 +98,100 @@ class AppStorage(object):
 
   @staticmethod
   def AddPoint(app_id, point_id):
-    AppStorage._APPS[app_id].points[point_id] = []
+    AppStorage._APPS[app_id].points[point_id] = AppStorage._Point(
+        subjects=tuple(), coord=None)
 
   @staticmethod
-  def AddSubject(app_id, point_id, subject_id, priority):
-    AppStorage._APPS[app_id].points[point_id].append((subject_id, priority))
+  def DeletePoint(app_id, point_id):
+    del AppStorage._APPS[app_id].points[point_id]
 
   @staticmethod
-  def GetSubjects(app_id, point_id):
-    return AppStorage._APPS[app_id].points[point_id]
+  def SetPointSubjects(app_id, point_id, subjects):
+    points = AppStorage._APPS[app_id].points
+    points[point_id] = points[point_id]._replace(subjects=subjects)
+
+  @staticmethod
+  def GetPointSubjects(app_id, point_id):
+    return AppStorage._APPS[app_id].points[point_id].subjects
+
+  @staticmethod
+  def SetPointCoord(app_id, point_id, coord):
+    points = AppStorage._APPS[app_id].points
+    points[point_id] = points[point_id]._replace(coord=coord)
+
+  @staticmethod
+  def GetPointsCoords(app_id, points_ids):
+    points = AppStorage._APPS[app_id].points
+    return tuple(
+        (point_id, points[point_id].coord)
+        for point_id in points_ids
+        if point_id in points
+    )
+
+  @staticmethod
+  def HasPoint(app_id, point_id):
+    return point_id in AppStorage._APPS[app_id].points
 
 
 class AuthUtils(object):
 
   @staticmethod
-  def GetHmac(app_id, msg):
-    hmac_key = AppStorage.GetHmacKey(app_id)
-    return hmac.new(hmac_key, str(msg)).digest()
-
-  @staticmethod
-  def ValidateHmac(app_id, msg, msg_hmac):
-    if AuthUtils.GetHmac(app_id, msg) != msg_hmac:
-      raise Exception('invalid hmac')
-
-  @staticmethod
-  def GetGeoAuthToken(app_id, point_id, method_name, ttl):
-    exp_time = time.time() + ttl
-    msg = (app_id, point_id, method_name, exp_time)
-    msg_hmac = AuthUtils.GetHmac(app_id, msg)
+  def GetGeoAuthToken(app_id, point_id, method_id, params):
+    exp_time = int(time.time() + AuthUtils._GEO_AUTH_TOKEN_TTL)
+    msg = (app_id, point_id, method_id, params, exp_time)
+    msg_hmac = AuthUtils._GetHmac(app_id, msg)
     return (msg, msg_hmac)
 
   @staticmethod
-  def ValidateGeoAuthToken(geo_auth_token, method_name):
+  def ValidateGeoAuthToken(geo_auth_token):
     msg, msg_hmac = geo_auth_token
-    app_id, point_id, actual_method_name, exp_time = msg
-
-    AuthUtils.ValidateHmac(app_id, msg, msg_hmac)
-
-    if actual_method_name != method_name:
-      raise Exception('method name mismatch')
-
+    app_id, point_id, method_id, params, exp_time = msg
+    AuthUtils._ValidateHmac(app_id, msg, msg_hmac)
     if exp_time < time.time():
       raise Exception('auth token has been expired')
-
-    return app_id, point_id
+    if not AppStorage.HasPoint(app_id, point_id):
+      raise Exception('app_id=%r has no point with id=%r' % (app_id, point_id))
+    return app_id, point_id, method_id, params
 
   @staticmethod
   def GetAppAuthToken(app_id):
     auth_key = AppStorage.GetAuthKey(app_id)
-
     return (app_id, auth_key)
 
   @staticmethod
   def ValidateAppAuthToken(app_auth_token):
     app_id, auth_key = app_auth_token
-
     if AppStorage.GetAuthKey(app_id) != auth_key:
       raise Exception('invalid app auth token')
-
     return app_id
 
 
+  _GEO_AUTH_TOKEN_TTL = 3600
+
+  @staticmethod
+  def _GetHmac(app_id, msg):
+    hmac_key = AppStorage.GetHmacKey(app_id)
+    return hmac.new(hmac_key, str(msg)).digest()
+
+  @staticmethod
+  def _ValidateHmac(app_id, msg, msg_hmac):
+    if AuthUtils._GetHmac(app_id, msg) != msg_hmac:
+      raise Exception('invalid hmac')
+
+
+class MethodId(object):
+  UPDATE_POINT = 1
+  NEAREST_POINTS = 2
+  POINTS_COORDS = 3
+
+
 class GeoApi(object):
+
+  @staticmethod
+  def Call(geo_auth_token, *args):
+    app_id, point_id, method_id, params = AuthUtils.ValidateGeoAuthToken(
+        geo_auth_token)
+    return _GEO_API_METHODS_TABLE[method_id](app_id, point_id, params, *args)
 
   # Earth radius in meters. See http://en.wikipedia.org/wiki/Earth_radius .
   _EARTH_RADIUS = 6371 * 1000
@@ -264,30 +294,36 @@ class GeoApi(object):
     return (x_id, y_id, z_id, zoom_level)
 
   @staticmethod
-  def _ExtendPoints(points, new_points, coord):
-    for point in new_points:
-      point_id = point.point_id
-      existing_point = points.get(point_id)
-
-      if existing_point and existing_point['exp_time'] > point.exp_time:
+  def _ExtendPoints(points_map, points):
+    for p in points:
+      point_id = p.point_id
+      if point_id in points_map:
         continue
-
-      points[point_id] = {
-          'point_id': point.point_id,
-          'coord': point.coord,
-          'priority': point.priority,
-          'distance': GeoApi._GetDistance(coord, point.coord),
-          'exp_time': point.exp_time,
+      points_map[point_id] = {
+          'point_id': point_id,
+          'priority': p.priority,
+          'exp_time': p.exp_time,
       }
 
   @staticmethod
-  def _FilterPoints(points, max_distance):
-    filtered_points = []
-    for point_id, point in points.iteritems():
-      if point['distance'] < max_distance:
-        filtered_points.append(point)
+  def _AddMissingCoordAndDistance(app_id, points_map, coord):
+    points_ids = tuple(
+        point_id
+        for point_id, p in points_map.items()
+        if 'coord' not in p
+    )
+    for point_id, p_coord in AppStorage.GetPointsCoords(app_id, points_ids):
+      p = points_map[point_id]
+      p['coord'] = p_coord
+      p['distance'] = GeoApi._GetDistance(coord, p_coord)
 
-    return filtered_points
+  @staticmethod
+  def _FilterPoints(points, max_distance):
+    return [
+        p
+        for p in points
+        if p['distance'] < max_distance
+    ]
 
   @staticmethod
   def _GetNearestSectorIds(sector_id):
@@ -326,24 +362,42 @@ class GeoApi(object):
     )
 
   @staticmethod
-  def GetNearestPoints(geo_auth_token, subject_id, coord, points_limit):
-    app_id, _ = AuthUtils.ValidateGeoAuthToken(geo_auth_token,
-        'GetNearestPoints')
+  def _UpdatePoint(app_id, point_id, params_unused, coord):
     coord = GeoApi._ToXYZ(coord)
+    subjects = AppStorage.GetPointSubjects(app_id, point_id)
+    AppStorage.SetPointCoord(app_id, point_id, coord)
+    max_zoom_level = AppStorage.GetMaxZoomLevel(app_id)
 
+    for subject_id, priority in subjects:
+      zoom_level = max_zoom_level
+      while True:
+        sector_id = GeoApi._GetSectorId(coord, zoom_level)
+
+        if not PointCache.UpdatePointInSector(app_id, subject_id, sector_id,
+            zoom_level, point_id, priority):
+          break
+
+        if not zoom_level:
+          break
+
+        zoom_level -= 1
+
+  @staticmethod
+  def _NearestPoints(app_id, point_id_unused, subject_id, coord, points_limit):
+    coord = GeoApi._ToXYZ(coord)
     zoom_level = AppStorage.GetMaxZoomLevel(app_id)
     tile_size = GeoApi._GetTileSize(zoom_level)
 
-    points = {}
+    points_map = {}
     while True:
       sector_id = GeoApi._GetSectorId(coord, zoom_level)
-
       for s_sector_id in GeoApi._GetNearestSectorIds(sector_id):
         sector_points = PointCache.GetPointsInSector(app_id, subject_id,
             s_sector_id, zoom_level)
-        GeoApi._ExtendPoints(points, sector_points, coord)
+        GeoApi._ExtendPoints(points_map, sector_points)
 
-      filtered_points = GeoApi._FilterPoints(points, tile_size)
+      GeoApi._AddMissingCoordAndDistance(app_id, points_map, coord)
+      filtered_points = GeoApi._FilterPoints(points_map.values(), tile_size)
       if len(filtered_points) > points_limit:
         break
 
@@ -355,55 +409,72 @@ class GeoApi(object):
 
     # Sort points by distance from the current coordinates and trim
     # excess points.
-    filtered_points.sort(key=lambda point: point['distance'])
+    filtered_points.sort(key=lambda p: p['distance'])
 
-    return tuple({
-        'point_id': point['point_id'],
-        'coord': GeoApi._FromXYZ(point['coord']),
-        'priority': point['priority'],
-        'distance': point['distance'] * GeoApi._EARTH_RADIUS * 4,
-    } for point in filtered_points[:points_limit])
+    return tuple(
+        {
+            'point_id': p['point_id'],
+            'coord': GeoApi._FromXYZ(p['coord']),
+            'priority': p['priority'],
+            'distance': p['distance'] * GeoApi._EARTH_RADIUS * 4,
+        }
+        for p in filtered_points[:points_limit]
+    )
 
   @staticmethod
-  def UpdatePoint(geo_auth_token, coord):
-    app_id, point_id = AuthUtils.ValidateGeoAuthToken(geo_auth_token,
-        'UpdatePoint')
-    coord = GeoApi._ToXYZ(coord)
+  def _PointsCoords(app_id, point_id_unused, points_ids):
+    return tuple(
+        {
+            'point_id': point_id,
+            'coord': GeoApi._FromXYZ(coord),
+        }
+        for point_id, coord in AppStorage.GetPointsCoords(app_id, points_ids)
+    )
 
-    subjects = AppStorage.GetSubjects(app_id, point_id)
 
-    max_zoom_level = AppStorage.GetMaxZoomLevel(app_id)
-
-    for subject_id, priority in subjects:
-      zoom_level = max_zoom_level
-      while True:
-        sector_id = GeoApi._GetSectorId(coord, zoom_level)
-
-        if not PointCache.UpdatePointInSector(app_id, subject_id, sector_id,
-            zoom_level, point_id, coord, priority):
-          break
-
-        if not zoom_level:
-          break
-
-        zoom_level -= 1
+_GEO_API_METHODS_TABLE = {
+    MethodId.UPDATE_POINT: GeoApi._UpdatePoint,
+    MethodId.NEAREST_POINTS: GeoApi._NearestPoints,
+    MethodId.POINTS_COORDS: GeoApi._PointsCoords,
+}
 
 
 class ManagementApi(object):
 
   @staticmethod
-  def CreatePoint(app_auth_token, point_id, subjects):
+  def CreatePoint(app_auth_token, point_id):
     app_id = AuthUtils.ValidateAppAuthToken(app_auth_token)
-
     AppStorage.AddPoint(app_id, point_id)
-    for subject_id, priority in subjects:
-      AppStorage.AddSubject(app_id, point_id, subject_id, priority)
 
   @staticmethod
-  def GetGeoAuthToken(app_auth_token, point_id, method_name, ttl):
+  def DeletePoint(app_auth_token, point_id):
     app_id = AuthUtils.ValidateAppAuthToken(app_auth_token)
+    AppStorage.DeletePoint(app_id, point_id)
 
-    return AuthUtils.GetGeoAuthToken(app_id, point_id, method_name, ttl)
+  @staticmethod
+  def SetPointSubjects(app_auth_token, point_id, subjects):
+    app_id = AuthUtils.ValidateAppAuthToken(app_auth_token)
+    AppStorage.SetPointSubjects(app_id, point_id, subjects)
+
+  @staticmethod
+  def GetUpdatePointAuthToken(app_auth_token, point_id):
+    return ManagementApi._GetAuthToken(app_auth_token, point_id,
+        MethodId.UPDATE_POINT, None)
+
+  @staticmethod
+  def GetNearestPointsAuthToken(app_auth_token, point_id, subject_id):
+    return ManagementApi._GetAuthToken(app_auth_token, point_id,
+        MethodId.NEAREST_POINTS, subject_id)
+
+  @staticmethod
+  def GetPointsCoordsAuthToken(app_auth_token, point_id, points_ids):
+    return ManagementApi._GetAuthToken(app_auth_token, point_id,
+        MethodId.POINTS_COORDS, points_ids)
+
+  @staticmethod
+  def _GetAuthToken(app_auth_token, point_id, method_id, params):
+    app_id = AuthUtils.ValidateAppAuthToken(app_auth_token)
+    return AuthUtils.GetGeoAuthToken(app_id, point_id, method_id, params)
 
 ################################################################################
 
@@ -412,8 +483,8 @@ import time
 
 
 MAX_ZOOM_LEVEL = 20
-POINTS_COUNT = 40000
-REQUESTS_COUNT = 1 * 1000
+POINTS_COUNT = 40
+REQUESTS_COUNT = 10
 
 app_id = 'foobar'
 subject_id = 123
@@ -426,36 +497,50 @@ app_auth_token = AuthUtils.GetAppAuthToken(app_id)
 for point_id in range(POINTS_COUNT):
   priority = random.random()
   subjects = ((subject_id, priority),)
-  ManagementApi.CreatePoint(app_auth_token, point_id, subjects)
+  ManagementApi.CreatePoint(app_auth_token, point_id)
+  ManagementApi.SetPointSubjects(app_auth_token, point_id, subjects)
 print '%d points created' % POINTS_COUNT
-
 raw_input('press enter to continue')
 
 start = time.time()
 for point_id in range(POINTS_COUNT):
-  geo_auth_token = ManagementApi.GetGeoAuthToken(app_auth_token, point_id,
-      'UpdatePoint', 60)
+  auth_token = ManagementApi.GetUpdatePointAuthToken(app_auth_token,
+      point_id)
   phi = math.asin(random.random() * 2 - 1) / math.pi * 180
   gamma = random.random() * 360 - 180
   elevation = random.random() * 10000 - 5000
   coord = (phi, gamma, elevation)
-  GeoApi.UpdatePoint(geo_auth_token, coord)
+  GeoApi.Call(auth_token, coord)
 end = time.time()
-print '%.0f updates/s' % (POINTS_COUNT / (end - start))
-
+print '%.0f UpdateProint reuqests/s' % (POINTS_COUNT / (end - start))
 raw_input('press enter to continue')
 
 start = time.time()
-for point_id in range(REQUESTS_COUNT):
-  geo_auth_token = ManagementApi.GetGeoAuthToken(app_auth_token, point_id,
-      'GetNearestPoints', 60)
+for _ in range(REQUESTS_COUNT):
+  range_size = 10
+  start_range = int(random.random() * POINTS_COUNT) - range_size
+  end_range = start_range + int(random.random() * range_size) + 1
+  point_id = int(random.random() * POINTS_COUNT)
+  points = range(start_range, end_range)
+  geo_auth_token = ManagementApi.GetPointsCoordsAuthToken(app_auth_token,
+      point_id, points)
+  coords = GeoApi.Call(geo_auth_token)
+  print 'points=%r, coords=%r' % (points, coords)
+end = time.time()
+print '%.0f Points requests/s' % (REQUESTS_COUNT /  (end - start))
+raw_input('press enter to continue')
+
+start = time.time()
+for _ in range(REQUESTS_COUNT):
+  point_id = int(random.random() * POINTS_COUNT)
+  geo_auth_token = ManagementApi.GetNearestPointsAuthToken(app_auth_token,
+      point_id, subject_id)
   phi = math.asin(random.random() * 2 - 1) / math.pi * 180
   gamma = random.random() * 360 - 180
   elevation = random.random() * 10000 - 5000
   coord = (phi, gamma, elevation)
-  points = GeoApi.GetNearestPoints(geo_auth_token, subject_id, coord,
-      points_limit)
+  points = GeoApi.Call(geo_auth_token, coord, points_limit)
+  print 'coord=%r, points_limit=%r, points=%r' % (coord, points_limit, points)
 end = time.time()
-print '%.0f requests/s' % (REQUESTS_COUNT /  (end - start))
-
+print '%.0f NearestPoints requests/s' % (REQUESTS_COUNT /  (end - start))
 raw_input('press enter to continue')
