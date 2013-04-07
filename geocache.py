@@ -188,13 +188,15 @@ class MethodId(object):
 class GeoApi(object):
 
   @staticmethod
-  def Call(geo_auth_token, *args):
+  def Call(geo_auth_token, **kwargs):
     app_id, point_id, method_id, params = AuthUtils.ValidateGeoAuthToken(
         geo_auth_token)
-    return _GEO_API_METHODS_TABLE[method_id](app_id, point_id, params, *args)
+    return _GEO_API_METHODS_TABLE[method_id](app_id, point_id, params, kwargs)
 
   # Earth radius in meters. See http://en.wikipedia.org/wiki/Earth_radius .
   _EARTH_RADIUS = 6371 * 1000
+
+  _DEFAULT_POINTS_LIMIT = 100
 
   @staticmethod
   def _GetDistance(coord1, coord2):
@@ -362,8 +364,30 @@ class GeoApi(object):
     )
 
   @staticmethod
-  def _UpdatePoint(app_id, point_id, params_unused, coord):
-    coord = GeoApi._ToXYZ(coord)
+  def _GetPointCoord(app_id, point_id, kwargs):
+    coord = kwargs.get('coord')
+    if coord is not None:
+      return GeoApi._ToXYZ(coord)
+    _, coord = AppStorage.GetPointsCoords(app_id, [point_id])[0]
+    return coord
+
+  @staticmethod
+  def _GetZoomLevel(app_id, kwargs):
+    max_zoom_level = AppStorage.GetMaxZoomLevel(app_id)
+    radius = kwargs.get('radius', 0)
+    if radius <= 0:
+      return max_zoom_level
+    multiplier = (GeoApi._EARTH_RADIUS * 2) / radius
+    zoom_level = int(math.log(multiplier, 2))
+    if zoom_level < 0:
+      return 0
+    if zoom_level > max_zoom_level:
+      return max_zoom_level
+    return zoom_level
+
+  @staticmethod
+  def _UpdatePoint(app_id, point_id, params_unused, kwargs):
+    coord = GeoApi._ToXYZ(kwargs['coord'])
     subjects = AppStorage.GetPointSubjects(app_id, point_id)
     AppStorage.SetPointCoord(app_id, point_id, coord)
     max_zoom_level = AppStorage.GetMaxZoomLevel(app_id)
@@ -383,9 +407,16 @@ class GeoApi(object):
         zoom_level -= 1
 
   @staticmethod
-  def _NearestPoints(app_id, point_id_unused, subject_id, coord, points_limit):
-    coord = GeoApi._ToXYZ(coord)
-    zoom_level = AppStorage.GetMaxZoomLevel(app_id)
+  def _NearestPoints(app_id, point_id, subject_id, kwargs):
+    """
+      kwargs may contain:
+        * coord - coordinates used for distance calculation
+        * radius - zoom radius
+        * points_limit - the maximum number of points to return
+    """
+    coord = GeoApi._GetPointCoord(app_id, point_id, kwargs)
+    points_limit = kwargs.get('points_limit', GeoApi._DEFAULT_POINTS_LIMIT)
+    zoom_level = GeoApi._GetZoomLevel(app_id, kwargs)
     tile_size = GeoApi._GetTileSize(zoom_level)
 
     points_map = {}
@@ -407,10 +438,7 @@ class GeoApi(object):
       zoom_level -= 1
       tile_size *= 2
 
-    # Sort points by distance from the current coordinates and trim
-    # excess points.
     filtered_points.sort(key=lambda p: p['distance'])
-
     return tuple(
         {
             'point_id': p['point_id'],
@@ -422,14 +450,28 @@ class GeoApi(object):
     )
 
   @staticmethod
-  def _PointsCoords(app_id, point_id_unused, points_ids):
-    return tuple(
+  def _PointsCoords(app_id, point_id, points_ids, kwargs):
+    """
+      kwargs may contain:
+        * coord - coordinates used for distance calculation
+        * radius - zoom radius
+        * points_limit - the maximum number of points to return
+    """
+    coord = GeoApi._GetPointCoord(app_id, point_id, kwargs)
+    points_limit = kwargs.get('points_limit', len(points_ids))
+    radius = kwargs.get('radius', 0)
+    points = [
         {
             'point_id': point_id,
-            'coord': GeoApi._FromXYZ(coord),
+            'coord': GeoApi._FromXYZ(p_coord),
+            'distance': GeoApi._GetDistance(coord, p_coord) * GeoApi._EARTH_RADIUS * 4,
         }
-        for point_id, coord in AppStorage.GetPointsCoords(app_id, points_ids)
-    )
+        for point_id, p_coord in AppStorage.GetPointsCoords(app_id, points_ids)
+    ]
+    if radius > 0:
+      points = [p for p in points if p['distance'] < radius]
+    points.sort(key=lambda p: p['distance'])
+    return points[:points_limit]
 
 
 _GEO_API_METHODS_TABLE = {
@@ -483,12 +525,12 @@ import time
 
 
 MAX_ZOOM_LEVEL = 20
-POINTS_COUNT = 40
+POINTS_COUNT = 4000
 REQUESTS_COUNT = 10
 
 app_id = 'foobar'
 subject_id = 123
-points_limit = 10
+points_limit = 3
 
 AppStorage.CreateApp(app_id, MAX_ZOOM_LEVEL)
 
@@ -510,7 +552,7 @@ for point_id in range(POINTS_COUNT):
   gamma = random.random() * 360 - 180
   elevation = random.random() * 10000 - 5000
   coord = (phi, gamma, elevation)
-  GeoApi.Call(auth_token, coord)
+  GeoApi.Call(auth_token, coord=coord)
 end = time.time()
 print '%.0f UpdateProint reuqests/s' % (POINTS_COUNT / (end - start))
 raw_input('press enter to continue')
@@ -539,7 +581,8 @@ for _ in range(REQUESTS_COUNT):
   gamma = random.random() * 360 - 180
   elevation = random.random() * 10000 - 5000
   coord = (phi, gamma, elevation)
-  points = GeoApi.Call(geo_auth_token, coord, points_limit)
+  points = GeoApi.Call(geo_auth_token, coord=coord, points_limit=points_limit,
+      radius=100000)
   print 'coord=%r, points_limit=%r, points=%r' % (coord, points_limit, points)
 end = time.time()
 print '%.0f NearestPoints requests/s' % (REQUESTS_COUNT /  (end - start))
